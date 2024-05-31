@@ -1,346 +1,177 @@
-import streamlit as st
-from streamlit_drawable_canvas import st_canvas
-from streamlit_image_coordinates import streamlit_image_coordinates
-
-
-from model.data_process.demo_data_process import process_ct_gt
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
+import argparse
+import os
+import torch
+import torch.nn.functional as F
+import json
 import monai.transforms as transforms
-from utils import show_points, make_fig, reflect_points_into_model, initial_rectangle, reflect_json_data_to_3D_box, reflect_box_into_model, run
-import nibabel as nib
-import tempfile
 
-print('script run')
+from model.segment_anything_volumetric import sam_model_registry
+from model.network.model import SegVol
+from model.data_process.demo_data_process import process_ct_gt
+from model.utils.monai_inferers_utils import sliding_window_inference, generate_box, select_points, build_binary_cube, build_binary_points, logits2roi_coor
+from model.utils.visualize import draw_result
+import streamlit as st
 
-#############################################
-# init session_state
-if 'option' not in  st.session_state:
-    st.session_state.option = None
-if 'text_prompt' not in st.session_state:
-    st.session_state.text_prompt = None
+def set_parse():
+    # %% set up parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_mode", default=True, type=bool)
+    parser.add_argument("--resume", type = str, default = 'C:/Users/WangHL/Desktop/Heart_SegVol/SegVol/medsam_model_e500.pth')
+    parser.add_argument("-infer_overlap", default=0.0, type=float, help="sliding window inference overlap")
+    parser.add_argument("-spatial_size", default=(32, 256, 256), type=tuple)
+    parser.add_argument("-patch_size", default=(4, 16, 16), type=tuple)
+    parser.add_argument('-work_dir', type=str, default='./work_dir')
+    ### demo
+    parser.add_argument("--clip_ckpt", type = str, default = 'model/config/clip')
+    args = parser.parse_args()
+    return args
 
-if 'reset_demo_case' not in st.session_state:
-    st.session_state.reset_demo_case = False
-
-if 'preds_3D' not in st.session_state:
-    st.session_state.preds_3D = None
-    st.session_state.preds_3D_ori = None
-    st.session_state.semantic_res = None
-
-if 'data_item' not in st.session_state:
-    st.session_state.data_item = None
-
-if 'points' not in st.session_state:
-    st.session_state.points = []
-
-if 'use_text_prompt' not in st.session_state:
-    st.session_state.use_text_prompt = False
-
-if 'use_point_prompt' not in st.session_state:
-    st.session_state.use_point_prompt = False
-
-if 'use_box_prompt' not in st.session_state:
-    st.session_state.use_box_prompt = False
-
-if 'rectangle_3Dbox' not in st.session_state:
-    st.session_state.rectangle_3Dbox = [0,0,0,0,0,0]
-
-if 'irregular_box' not in st.session_state:
-    st.session_state.irregular_box = False
-
-if 'running' not in st.session_state:
-    st.session_state.running = False
-
-if 'transparency' not in st.session_state:
-    st.session_state.transparency = 0.25
-
-case_list = [
-    'model/asset/FLARE22_Tr_0002_0000.nii.gz',
-    'model/asset/FLARE22_Tr_0005_0000.nii.gz',
-    'model/asset/FLARE22_Tr_0034_0000.nii.gz',
-    'model/asset/FLARE22_Tr_0045_0000.nii.gz'
-]
-
-#############################################
-
-#############################################
-# reset functions
-def clear_prompts():
-    st.session_state.points = []
-    st.session_state.rectangle_3Dbox = [0,0,0,0,0,0]
-
-def reset_demo_case():
-    st.session_state.data_item = None
-    st.session_state.reset_demo_case = True
-    clear_prompts()
-
-def clear_file():
-    st.session_state.option = None
-    process_ct_gt.clear()
-    reset_demo_case()
-    clear_prompts()
-
-#############################################
-
-st.image(Image.open('model/asset/method_back.jpg'), use_column_width=True)
-
-github_col, arxive_col = st.columns(2)
-
-with github_col:
-    st.write('GitHub repo:https://github.com/BAAI-DCAI/SegVol')
-
-with arxive_col:
-    st.write('Paper:https://arxiv.org/abs/2311.13385')
-
-
-# modify demo case here
-demo_type = st.radio(
-        "Demo case source",
-        ["Select", "Upload"],
-        on_change=clear_file
-    )
-
-if demo_type=="Select":
-    uploaded_file = st.selectbox(
-        "Select a demo case",
-        case_list,
-        index=None,
-        placeholder="Select a demo case...",
-        on_change=reset_demo_case
-    )
-else:
-    uploaded_file = st.file_uploader("Upload demo case(nii.gz)", type='nii.gz', on_change=reset_demo_case)
-
-st.session_state.option = uploaded_file
-
-if  st.session_state.option is not None and \
-    st.session_state.reset_demo_case or (st.session_state.data_item is None and st.session_state.option is not None):
-
-    st.session_state.data_item = process_ct_gt(st.session_state.option)
-    st.session_state.reset_demo_case = False
-    st.session_state.preds_3D = None
-    st.session_state.preds_3D_ori = None
-    st.session_state.semantic_res = None
-
-prompt_col1, prompt_col2 = st.columns(2)
-
-with prompt_col1:
-    st.session_state.use_text_prompt = st.toggle('Sematic prompt')
-    text_prompt_type = st.radio(
-        "Sematic prompt type",
-        ["Predefined", "Custom"],
-        disabled=(not st.session_state.use_text_prompt)
-    )
-    if text_prompt_type == "Predefined":
-        pre_text = st.selectbox(
-            "Predefined anatomical category:",
-            ['liver', 'right kidney', 'spleen', 'pancreas', 'aorta', 'inferior vena cava', 'right adrenal gland', 'left adrenal gland', 'gallbladder', 'esophagus', 'stomach', 'duodenum', 'left kidney'],
-            index=None,
-            disabled=(not st.session_state.use_text_prompt)
-        )
-    else:
-        pre_text = st.text_input('Enter an Anatomical word or phrase:', None, max_chars=20,
-                                                     disabled=(not st.session_state.use_text_prompt))
-    if pre_text is None or len(pre_text) > 0:
-        st.session_state.text_prompt = pre_text
-    else:
-        st.session_state.text_prompt = None
-
-
-with prompt_col2:
-    spatial_prompt_on = st.toggle('Spatial prompt', on_change=clear_prompts)
-    spatial_prompt = st.radio(
-        "Spatial prompt type",
-        ["Point prompt", "Box prompt"],
-        on_change=clear_prompts,
-        disabled=(not spatial_prompt_on))
-    st.session_state.enforce_zoom = st.checkbox('Enforce zoom-out-zoom-in')
-
-if spatial_prompt == "Point prompt":
-    st.session_state.use_point_prompt = True
-    st.session_state.use_box_prompt = False
-elif spatial_prompt == "Box prompt":
-    st.session_state.use_box_prompt = True
-    st.session_state.use_point_prompt = False
-else:
-    st.session_state.use_point_prompt = False
-    st.session_state.use_box_prompt = False
-
-if not spatial_prompt_on:
-    st.session_state.use_point_prompt = False
-    st.session_state.use_box_prompt = False
-
-if not st.session_state.use_text_prompt:
-    st.session_state.text_prompt = None
-
-if st.session_state.option is None:
-    st.write('please select demo case first')
-else:
-    image_3D = st.session_state.data_item['z_image'][0].numpy()
-    col_control1, col_control2 = st.columns(2)
-
-    with col_control1:
-        selected_index_z = st.slider('X-Y view', 0, image_3D.shape[0] - 1, 162, key='xy', disabled=st.session_state.running)
-
-    with col_control2:
-        selected_index_y = st.slider('X-Z view', 0, image_3D.shape[1] - 1, 162, key='xz', disabled=st.session_state.running)
-        if st.session_state.use_box_prompt:
-            top, bottom = st.select_slider(
-                'Top and bottom of box',
-                options=range(0, 325),
-                value=(0, 324), 
-                disabled=st.session_state.running
-            )
-            st.session_state.rectangle_3Dbox[0] = top
-            st.session_state.rectangle_3Dbox[3] = bottom
-    col_image1, col_image2 = st.columns(2)
-
-    if st.session_state.preds_3D is not None:
-        st.session_state.transparency = st.slider('Mask opacity', 0.0, 1.0, 0.25, disabled=st.session_state.running)
-
-    with col_image1:
-        
-        image_z_array = image_3D[selected_index_z]
-
-        preds_z_array = None
-        if st.session_state.preds_3D is not None:
-            preds_z_array = st.session_state.preds_3D[selected_index_z]
-            
-        image_z = make_fig(image_z_array, preds_z_array, st.session_state.points, selected_index_z, 'xy')
-        
-        
-        if st.session_state.use_point_prompt:
-            value_xy = streamlit_image_coordinates(image_z, width=325)
-            
-            if value_xy is not None:
-                point_ax_xy = (selected_index_z, value_xy['y'], value_xy['x'])
-                if len(st.session_state.points) >= 3:
-                    st.warning('Max point num is 3', icon="⚠️")
-                elif point_ax_xy not in st.session_state.points:
-                    st.session_state.points.append(point_ax_xy)
-                    print('point_ax_xy add rerun')
-                    st.rerun()
-        elif st.session_state.use_box_prompt:
-            canvas_result_xy = st_canvas(
-                fill_color="rgba(255, 165, 0, 0.3)",  # Fixed fill color with some opacity
-                stroke_width=3,
-                stroke_color='#2909F1',
-                background_image=image_z,
-                update_streamlit=True,
-                height=325,
-                width=325,
-                drawing_mode='transform',
-                point_display_radius=0,
-                key="canvas_xy",
-                initial_drawing=initial_rectangle,
-                display_toolbar=True
-            )
-            try:
-                print(canvas_result_xy.json_data['objects'][0]['angle'])
-                if canvas_result_xy.json_data['objects'][0]['angle'] != 0:
-                    st.warning('Rotating is undefined behavior', icon="⚠️")
-                    st.session_state.irregular_box = True
-                else:
-                    st.session_state.irregular_box = False
-                reflect_json_data_to_3D_box(canvas_result_xy.json_data, view='xy')
-            except:
-                print('exception')
-                pass
-        else:
-            st.image(image_z, use_column_width=False)
-
-    with col_image2:
-        image_y_array = image_3D[:, selected_index_y, :]
-        
-        preds_y_array = None
-        if st.session_state.preds_3D is not None:
-            preds_y_array = st.session_state.preds_3D[:, selected_index_y, :]
-        
-        image_y = make_fig(image_y_array, preds_y_array, st.session_state.points, selected_index_y, 'xz')
-        
-        if st.session_state.use_point_prompt:
-            value_yz = streamlit_image_coordinates(image_y, width=325)
-            
-            if value_yz is not None:
-                point_ax_xz = (value_yz['y'], selected_index_y, value_yz['x'])
-                if len(st.session_state.points) >= 3:
-                    st.warning('Max point num is 3', icon="⚠️")
-                elif point_ax_xz not in st.session_state.points:
-                    st.session_state.points.append(point_ax_xz)
-                    print('point_ax_xz add rerun')
-                    st.rerun()
-        elif st.session_state.use_box_prompt:
-            if st.session_state.rectangle_3Dbox[1] <= selected_index_y and selected_index_y <= st.session_state.rectangle_3Dbox[4]:
-                draw = ImageDraw.Draw(image_y)
-                #rectangle xz view (upper-left and lower-right)
-                rectangle_coords = [(st.session_state.rectangle_3Dbox[2], st.session_state.rectangle_3Dbox[0]),
-                                    (st.session_state.rectangle_3Dbox[5], st.session_state.rectangle_3Dbox[3])]
-                # Draw the rectangle on the image
-                draw.rectangle(rectangle_coords, outline='#2909F1', width=3)
-            st.image(image_y, use_column_width=False)
-        else:
-            st.image(image_y, use_column_width=False)
-
-if st.session_state.semantic_res is not None:
-    st.write('The mask is ', st.session_state.semantic_res)
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    if st.button("Clear", use_container_width=True,
-                 disabled=(st.session_state.option is None or (len(st.session_state.points)==0 and not st.session_state.use_box_prompt and st.session_state.preds_3D is None))):
-        clear_prompts()
-        st.session_state.preds_3D = None
-        st.session_state.preds_3D_ori = None
-        st.rerun()
-
-with col2:
-    img_nii = None
-    if st.session_state.preds_3D_ori is not None and st.session_state.data_item is not None:
-        meta_dict = st.session_state.data_item['meta']
-        foreground_start_coord = st.session_state.data_item['foreground_start_coord']
-        foreground_end_coord = st.session_state.data_item['foreground_end_coord']
-        original_shape = st.session_state.data_item['ori_shape']
-        pred_array = st.session_state.preds_3D_ori
-
-        original_array = np.zeros(original_shape)
-        print(original_array.shape, pred_array.shape)
-        original_array[foreground_start_coord[0]:foreground_end_coord[0], 
-                    foreground_start_coord[1]:foreground_end_coord[1], 
-                    foreground_start_coord[2]:foreground_end_coord[2]] = pred_array
-
-        original_array = original_array.transpose(2, 1, 0)
-        img_nii = nib.Nifti1Image(original_array, affine=meta_dict['affine'])
-
-        with tempfile.NamedTemporaryFile(suffix=".nii.gz") as tmpfile:
-            nib.save(img_nii, tmpfile.name)
-            with open(tmpfile.name, "rb") as f:
-                bytes_data = f.read()
-                st.download_button(
-                    label="Download result(.nii.gz)",
-                    data=bytes_data,
-                    file_name="segvol_preds.nii.gz",
-                    mime="application/octet-stream",
-                    disabled=img_nii is None
-                )
+def zoom_in_zoom_out(args, segvol_model, image, image_resize, text_prompt, point_prompt, box_prompt):
+    image_single_resize = image_resize
+    image_single = image[0,0]
+    ori_shape = image_single.shape
+    resize_shape = image_single_resize.shape[2:]
     
+    # generate prompts
+    text_single = None if text_prompt is None else [text_prompt]
+    points_single = None
+    box_single = None
 
-with col3:
-    run_button_name = 'Run'if not st.session_state.running else 'Running'
-    if st.button(run_button_name, type="primary", use_container_width=True,
-            disabled=(
-                st.session_state.data_item is None or
-                (st.session_state.text_prompt is None and len(st.session_state.points) == 0 and st.session_state.use_box_prompt is False) or 
-                st.session_state.irregular_box or 
-                st.session_state.running
-                )):
-        st.session_state.running = True
-        st.rerun()
+    if args.use_point_prompt:
+        point, point_label = point_prompt
+        points_single = (point.unsqueeze(0).float(), point_label.unsqueeze(0).float()) 
+        binary_points_resize = build_binary_points(point, point_label, resize_shape)
+    if args.use_box_prompt:
+        box_single = box_prompt.unsqueeze(0).float()
+        binary_cube_resize = build_binary_cube(box_single, binary_cube_shape=resize_shape)
+    
+    ####################
+    # zoom-out inference:
+    print('--- zoom out inference ---')
+    print(text_single)
+    print(f'use text-prompt [{text_single!=None}], use box-prompt [{box_single!=None}], use point-prompt [{points_single!=None}]')
+    with torch.no_grad():
+        logits_global_single = segvol_model(image_single_resize,
+                                            text=text_single, 
+                                            boxes=box_single, 
+                                            points=points_single)
+    # for key in score.keys():
+    #     if key == 'res':
+    #         print(f'The mask is {score[key]}')
+    #         st.session_state.semantic_res = score[key]
+    #     else:
+    #         print(f'{key} scored {score[key]:.4f}')
+    # resize back global logits
+    logits_global_single = F.interpolate(
+            logits_global_single.cpu(),
+            size=ori_shape, mode='nearest')[0][0]
+    
+    # build prompt reflection for zoom-in
+    if args.use_point_prompt:
+        binary_points = F.interpolate(
+            binary_points_resize.unsqueeze(0).unsqueeze(0).float(),
+            size=ori_shape, mode='nearest')[0][0]
+    if args.use_box_prompt:
+        binary_cube = F.interpolate(
+            binary_cube_resize.unsqueeze(0).unsqueeze(0).float(),
+            size=ori_shape, mode='nearest')[0][0]
+    # draw_result('unknow', image_single_resize, None, point_prompt, logits_global_single, logits_global_single)
+    if not args.use_zoom_in:
+        return logits_global_single
 
-if st.session_state.running:
-    st.session_state.running = False
-    with st.status("Running...", expanded=False) as status:
-        run()
-    st.rerun()
+    ####################
+    # zoom-in inference:
+    min_d, min_h, min_w, max_d, max_h, max_w = logits2roi_coor(args.spatial_size, logits_global_single)
+    if min_d is None:
+        print('Fail to detect foreground!')
+        return logits_global_single
+
+    # Crop roi
+    image_single_cropped = image_single[min_d:max_d+1, min_h:max_h+1, min_w:max_w+1].unsqueeze(0).unsqueeze(0)
+    global_preds = (torch.sigmoid(logits_global_single[min_d:max_d+1, min_h:max_h+1, min_w:max_w+1])>0.5).long()
+    
+    assert not (args.use_box_prompt and args.use_point_prompt)
+    # label_single_cropped = label_single[min_d:max_d+1, min_h:max_h+1, min_w:max_w+1].unsqueeze(0).unsqueeze(0)
+    prompt_reflection = None
+    if args.use_box_prompt:
+        binary_cube_cropped = binary_cube[min_d:max_d+1, min_h:max_h+1, min_w:max_w+1]
+        prompt_reflection = (
+            binary_cube_cropped.unsqueeze(0).unsqueeze(0),
+            global_preds.unsqueeze(0).unsqueeze(0)
+        )
+    if args.use_point_prompt:
+        binary_points_cropped = binary_points[min_d:max_d+1, min_h:max_h+1, min_w:max_w+1]
+        prompt_reflection = (
+            binary_points_cropped.unsqueeze(0).unsqueeze(0),
+            global_preds.unsqueeze(0).unsqueeze(0)
+        )
+
+    ## inference
+    with torch.no_grad():
+        logits_single_cropped = sliding_window_inference(
+                image_single_cropped, prompt_reflection,
+                args.spatial_size, 1, segvol_model, args.infer_overlap,
+                text=text_single,
+                use_box=args.use_box_prompt,
+                use_point=args.use_point_prompt,
+                logits_global_single=logits_global_single,
+            )
+        logits_single_cropped = logits_single_cropped.cpu().squeeze()
+        if logits_single_cropped.shape != logits_global_single.shape:
+            logits_global_single[min_d:max_d+1, min_h:max_h+1, min_w:max_w+1] = logits_single_cropped
+
+    return logits_global_single
+
+@st.cache_resource
+def build_model():
+    # build model
+    st.write('building model')
+    clip_ckpt = 'model/config/clip'
+    resume = 'C:/Users/WangHL/Desktop/Heart_SegVol/SegVol/medsam_model_e500.pth'
+    sam_model = sam_model_registry['vit']()
+    segvol_model = SegVol(
+                        image_encoder=sam_model.image_encoder, 
+                        mask_decoder=sam_model.mask_decoder,
+                        prompt_encoder=sam_model.prompt_encoder,
+                        clip_ckpt=clip_ckpt,
+                        roi_size=(32,256,256),
+                        patch_size=(4,16,16),
+                        test_mode=True,
+                        )
+    segvol_model = torch.nn.DataParallel(segvol_model)
+    segvol_model.eval()
+    # load param
+    if os.path.isfile(resume):
+        ## Map model to be loaded to specified single GPU
+        loc = 'cpu'
+        checkpoint = torch.load(resume, map_location=loc)
+        segvol_model.load_state_dict(checkpoint['model'], strict=True)
+        print("loaded checkpoint '{}' (epoch {})".format(resume, checkpoint['epoch']))
+    print('model build done!')
+    return segvol_model
+
+@st.cache_data
+def inference_case(_image, _image_zoom_out, _point_prompt, text_prompt, _box_prompt):
+    # seg config
+    args = set_parse()
+    args.use_zoom_in = False
+    args.use_text_prompt = text_prompt is not None
+    args.use_box_prompt = _box_prompt is not None
+    args.use_point_prompt = _point_prompt is not None
+
+    segvol_model = build_model()
+
+    # run inference
+    logits = zoom_in_zoom_out(
+        args, segvol_model, 
+        _image.unsqueeze(0), _image_zoom_out.unsqueeze(0), 
+        text_prompt, _point_prompt, _box_prompt)
+    print(logits.shape)
+    resize_transform = transforms.Compose([
+        transforms.AddChannel(),
+        transforms.Resize((325,325,325), mode='trilinear')
+    ]
+    )
+    logits_resize = resize_transform(logits)[0]
+    return (torch.sigmoid(logits_resize) > 0.5).int().numpy(), (torch.sigmoid(logits) > 0.5).int().numpy()
+    
