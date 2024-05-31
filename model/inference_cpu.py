@@ -16,7 +16,7 @@ def set_parse():
     # %% set up parser
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_mode", default=True, type=bool)
-    parser.add_argument("--resume", type = str, default = 'SegVol_v1.pth')
+    parser.add_argument("--resume", type = str, default = 'C:/Users/WangHL/Desktop/Heart_SegVol/SegVol/medsam_model_e500.pth')
     parser.add_argument("-infer_overlap", default=0.0, type=float, help="sliding window inference overlap")
     parser.add_argument("-spatial_size", default=(32, 256, 256), type=tuple)
     parser.add_argument("-patch_size", default=(4, 16, 16), type=tuple)
@@ -127,7 +127,7 @@ def build_model():
     # build model
     st.write('building model')
     clip_ckpt = 'model/config/clip'
-    resume = 'SegVol_v1.pth'
+    resume = 'C:/Users/WangHL/Desktop/Heart_SegVol/SegVol/medsam_model_e500.pth'
     sam_model = sam_model_registry['vit']()
     segvol_model = SegVol(
                         image_encoder=sam_model.image_encoder, 
